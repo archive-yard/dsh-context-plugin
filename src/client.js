@@ -564,7 +564,7 @@ function clientPlugin() {
             h('div', { className: 'dsh-ctx-header' },
               h('div', { className: 'dsh-ctx-title' },
                 h('span', null, '📁'),
-                h('span', null, 'Workspace Context Ingestion')
+                h('span', null, 'dsh-context-plugin')
               ),
               h('div', { style: { display: 'flex', gap: '4px' } },
                 h('button', {
@@ -738,7 +738,7 @@ function clientPlugin() {
             fontSize: '12px',
             gap: '6px'
           },
-          title: 'Open Workspace Context Ingestion Window',
+          title: 'Open dsh-context-plugin Window',
           onClick: () => {
             updateWindowState({ isOpen: true, isMinimized: false });
           }
