@@ -4,15 +4,14 @@
  * Registers:
  * 1. An interactive floating UI window in `shell.overlay`
  * 2. An action button in `conversation.session.header.actions`
+ * 3. An action button in `conversation.input.left`
  * 
  * Features:
- * - Displays active workspace path with editable input override
- * - Configurable link switch between `file:///` and `vscode://file/`
  * - Scans workspace files respecting .gitignore, .dshignore, and .git
  * - Detects binary files and replaces content with notice
  * - Dynamically calculates code fence backticks (>= 3 backticks)
- * - Shows loading spinner and progress counter (Reading X/N, Injecting X/N)
- * - Delivers each file as an individual prompt turn into the chat session
+ * - Inserts all formatted files into the composer draft as a single prompt
+ * - Leaves cursor/space at the bottom so user can immediately type their request
  */
 
 function clientPlugin() {
@@ -23,11 +22,16 @@ function clientPlugin() {
       const slots = ctx.get('slots');
       if (!slots) return;
 
-      // Global window state emitter so Header Action Button and Overlay Window stay in sync
+      // Shared cross-slot coordinator
       const listeners = new Set();
       const windowState = {
         isOpen: true,
         isMinimized: false
+      };
+
+      const sharedStore = {
+        inputActions: null,
+        currentDraft: ''
       };
 
       function updateWindowState(patch) {
@@ -341,7 +345,7 @@ function clientPlugin() {
         const [scheme, setScheme] = React.useState('file'); // 'file' | 'vscode'
         const [scanResult, setScanResult] = React.useState(null);
         const [selectedFiles, setSelectedFiles] = React.useState(new Set());
-        const [phase, setPhase] = React.useState('idle'); // 'idle' | 'scanning' | 'reading' | 'injecting' | 'completed' | 'error'
+        const [phase, setPhase] = React.useState('idle'); // 'idle' | 'scanning' | 'reading' | 'completed' | 'error'
         const [progress, setProgress] = React.useState({ current: 0, total: 0, file: '', phaseText: '' });
         const [errorMessage, setErrorMessage] = React.useState('');
         const [successMessage, setSuccessMessage] = React.useState('');
@@ -407,30 +411,12 @@ function clientPlugin() {
           }
         };
 
-        // Ingest files into chat session
-        const handleIngest = async () => {
+        // Ingest files into Composer draft
+        const handleInsertIntoComposer = async () => {
           setErrorMessage('');
           setSuccessMessage('');
 
-          // 1. Resolve active session
-          let session = null;
-          try {
-            const sessionsService = ctx.get('sessions');
-            const currentSessionId = sessionsState?.current || props.sessionId;
-            if (currentSessionId && sessionsService) {
-              const binding = sessionsService.binding(currentSessionId);
-              session = binding?.session;
-            }
-          } catch (e) {
-            console.error('Session resolution error', e);
-          }
-
-          if (!session) {
-            setErrorMessage('No active session found. Please open a chat session before ingesting files.');
-            return;
-          }
-
-          // 2. Scan if not already scanned
+          // 1. Scan if not already scanned
           let targetFiles = [];
           if (!scanResult || scanResult.files.length === 0) {
             setPhase('scanning');
@@ -457,15 +443,15 @@ function clientPlugin() {
           }
 
           const total = targetFiles.length;
+          const formattedBlocks = [];
 
-          // 3. Process each file
+          // 2. Read each file with progress feedback
           try {
+            setPhase('reading');
             for (let i = 0; i < total; i++) {
               const file = targetFiles[i];
               const idx = i + 1;
 
-              // Step 3a: Read file
-              setPhase('reading');
               setProgress({
                 current: idx,
                 total,
@@ -480,39 +466,63 @@ function clientPlugin() {
                 extension: file.extension
               });
 
-              // Step 3b: Build header link
+              // Format header link
               const abs = file.absolutePath.startsWith('/') ? file.absolutePath : ('/' + file.absolutePath);
               const headerLink = scheme === 'vscode'
                 ? `[\`${file.relativePath}\`](vscode://file${abs})`
                 : `[\`${file.relativePath}\`](file://${abs})`;
 
-              // Step 3c: Format the individual turn
+              // Dynamic code fence and content
               const fence = readRes.fence || '```';
               const ext = readRes.extension || '';
               const content = readRes.content || '';
               const normalizedContent = content.endsWith('\n') ? content : (content + '\n');
-              const turnText = `${headerLink}\n\n${fence}${ext}\n${normalizedContent}${fence}`;
+              const block = `${headerLink}\n\n${fence}${ext}\n${normalizedContent}${fence}`;
+              formattedBlocks.push(block);
 
-              // Step 3d: Inject prompt turn
-              setPhase('injecting');
-              setProgress({
-                current: idx,
-                total,
-                file: file.relativePath,
-                phaseText: `Injecting ${idx}/${total}: ${file.relativePath}`
-              });
+              await ctx.timeout(15);
+            }
 
-              const promptOutcome = await session.prompt([{ type: 'text', text: turnText }], 'queue');
-              if (!promptOutcome || !promptOutcome.ok) {
-                console.error('Failed prompt turn for', file.relativePath, promptOutcome);
+            // 3. Assemble full prompt with extra space at the bottom for the user request
+            const filesBlock = formattedBlocks.join('\n\n');
+            const existingDraft = (sharedStore.currentDraft || '').trim();
+            const fullDraft = existingDraft ? `${filesBlock}\n\n${existingDraft}` : `${filesBlock}\n\n`;
+
+            // 4. Set draft via inputActions (with DOM fallback)
+            let draftApplied = false;
+            if (sharedStore.inputActions && typeof sharedStore.inputActions.setDraft === 'function') {
+              try {
+                sharedStore.inputActions.setDraft(fullDraft);
+                draftApplied = true;
+              } catch (e) {
+                console.error('setDraft error', e);
               }
+            }
 
-              // Delay to smoothly queue messages
-              await ctx.timeout(100);
+            if (!draftApplied && typeof document !== 'undefined') {
+              const textarea = document.querySelector('textarea');
+              if (textarea) {
+                const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+                if (setter) {
+                  setter.call(textarea, fullDraft);
+                } else {
+                  textarea.value = fullDraft;
+                }
+                textarea.dispatchEvent(new Event('input', { bubbles: true }));
+                textarea.focus();
+                textarea.selectionStart = textarea.selectionEnd = fullDraft.length;
+                draftApplied = true;
+              }
             }
 
             setPhase('completed');
-            setSuccessMessage(`Successfully injected ${total} file${total > 1 ? 's' : ''} into chat session!`);
+            setSuccessMessage(`Inserted ${total} file${total > 1 ? 's' : ''} into composer! Write your request below and press Enter.`);
+
+            // Automatically minimize after 1.5 seconds so user can write their prompt
+            ctx.timeout(() => {
+              updateWindowState({ isMinimized: true });
+            }, 1500);
+
           } catch (err) {
             setErrorMessage('Ingestion error: ' + (err.message || String(err)));
             setPhase('error');
@@ -520,7 +530,6 @@ function clientPlugin() {
         };
 
         if (!win.isOpen) {
-          // Render a compact floating pill when closed/hidden
           return h('div', { className: 'dsh-ctx-overlay-container' },
             h('button', {
               className: 'dsh-ctx-min-badge',
@@ -546,7 +555,7 @@ function clientPlugin() {
           );
         }
 
-        const isBusy = phase === 'scanning' || phase === 'reading' || phase === 'injecting';
+        const isBusy = phase === 'scanning' || phase === 'reading';
         const currentPathDisplay = workspacePath || '(auto-detecting...)';
 
         return h('div', { className: 'dsh-ctx-overlay-container' },
@@ -663,12 +672,12 @@ function clientPlugin() {
                 )
               ),
 
-              // Progress Bar & Status (when reading/injecting)
+              // Progress Bar & Status (when reading)
               isBusy && h('div', { className: 'dsh-ctx-progress' },
                 h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: '11px' } },
                   h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px' } },
                     h('span', { className: 'dsh-ctx-spinner' }),
-                    h('span', { style: { fontWeight: 500 } }, progress.phaseText || 'Processing...')
+                    h('span', { style: { fontWeight: 500 } }, progress.phaseText || 'Reading files...')
                   ),
                   progress.total > 0 && h('span', { style: { opacity: 0.8 } },
                     `${Math.round((progress.current / progress.total) * 100)}%`
@@ -688,19 +697,19 @@ function clientPlugin() {
               // Success Notice
               successMessage && h('div', { className: 'dsh-ctx-notice-success' }, successMessage),
 
-              // Primary Action Button showing workspace path
+              // Primary Action Button: Insert into Composer
               h('button', {
                 className: 'dsh-ctx-btn dsh-ctx-btn-primary',
                 disabled: isBusy || !workspacePath.trim(),
-                onClick: handleIngest
+                onClick: handleInsertIntoComposer
               },
                 isBusy ? [
                   h('span', { key: 'sp', className: 'dsh-ctx-spinner' }),
-                  h('span', { key: 'tx' }, progress.phaseText || 'Processing...')
+                  h('span', { key: 'tx' }, progress.phaseText || 'Reading files...')
                 ] : [
                   h('span', { key: 'ic' }, '📥'),
                   h('span', { key: 'lb', style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
-                    `Ingest: ${currentPathDisplay}`
+                    `Insert into Composer: ${currentPathDisplay}`
                   )
                 ]
               )
@@ -711,6 +720,17 @@ function clientPlugin() {
 
       // Header Action Button mounted in conversation.session.header.actions
       function HeaderActionButton(props) {
+        // Capture inputActions and inputState into sharedStore
+        if (props.inputActions) {
+          sharedStore.inputActions = props.inputActions;
+        }
+        if (props.useInput) {
+          try {
+            const inputState = props.useInput(s => s);
+            sharedStore.currentDraft = inputState?.draft || '';
+          } catch (e) {}
+        }
+
         return h('button', {
           className: 'dsh-ctx-btn',
           style: {
@@ -728,6 +748,37 @@ function clientPlugin() {
         );
       }
 
+      // Composer Toolbar Button mounted in conversation.input.left
+      function ComposerToolbarButton(props) {
+        if (props.inputActions) {
+          sharedStore.inputActions = props.inputActions;
+        }
+        if (props.useInput) {
+          try {
+            const inputState = props.useInput(s => s);
+            sharedStore.currentDraft = inputState?.draft || '';
+          } catch (e) {}
+        }
+
+        return h('button', {
+          className: 'dsh-ctx-btn',
+          style: {
+            padding: '3px 8px',
+            fontSize: '11px',
+            gap: '5px',
+            background: 'transparent',
+            borderColor: 'transparent'
+          },
+          title: 'Ingest workspace files into composer',
+          onClick: () => {
+            updateWindowState({ isOpen: true, isMinimized: false });
+          }
+        },
+          h('span', null, '📁'),
+          h('span', null, 'Context')
+        );
+      }
+
       // Register components in Cordis slots
       slots.inject('shell.overlay', () => slots.register(
         { name: 'shell.overlay', id: 'workspace-context-overlay' },
@@ -737,6 +788,11 @@ function clientPlugin() {
       slots.inject('conversation.session.header.actions', () => slots.register(
         { name: 'conversation.session.header.actions', id: 'workspace-context-action', order: 15 },
         HeaderActionButton
+      ));
+
+      slots.inject('conversation.input.left', () => slots.register(
+        { name: 'conversation.input.left', id: 'workspace-context-input-btn', order: 50 },
+        ComposerToolbarButton
       ));
     }
   };

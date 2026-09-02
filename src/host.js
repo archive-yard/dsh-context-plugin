@@ -229,27 +229,6 @@ function hostPlugin() {
 
         try {
           const target = await fs.resolve(absolutePath);
-          // Null-byte check on first 8KB of bytes
-          const bytes = await fs.readBytes(target, undefined, 8192);
-          let hasNull = false;
-          for (let i = 0; i < bytes.length; i++) {
-            if (bytes[i] === 0) {
-              hasNull = true;
-              break;
-            }
-          }
-
-          if (hasNull) {
-            return {
-              relativePath,
-              absolutePath,
-              extension: extension || '',
-              content: '*Binary file - content not displayed.*',
-              isBinary: true,
-              fence: '```'
-            };
-          }
-
           const text = await fs.readText(target);
           const fence = getBacktickFence(text);
           return {
